@@ -1,4 +1,4 @@
-# Semantic Layer — E-commerce
+# Building a Semantic Layer with (Synthetic) E-commerce Data
 
 For anyone who wants hands-on experience building a semantic layer using realistic e-commerce data and meaningful business metrics. Includes a custom metric engine (Python + YAML) and a dbt transformation layer on the same four raw tables.
 

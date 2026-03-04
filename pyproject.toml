@@ -1,0 +1,14 @@
+[project]
+name = "semantic"
+version = "0.1.0"
+description = "A semantic layer on a synthetic e-commerce dataset — custom metric engine (Python + YAML) and dbt transformation layer"
+requires-python = ">=3.13"
+dependencies = [
+    "dbt-core>=1.11.6",
+    "dbt-duckdb>=1.10.1",
+    "duckdb>=1.4.4",
+    "faker>=40.5.1",
+    "numpy>=2.4.2",
+    "pandas>=3.0.1",
+    "pyyaml>=6.0.3",
+]

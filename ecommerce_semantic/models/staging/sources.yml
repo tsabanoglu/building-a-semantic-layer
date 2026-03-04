@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: main
+    database: ecommerce
+    schema: main
+    tables:
+      - name: customers
+      - name: orders
+      - name: order_items
+      - name: products

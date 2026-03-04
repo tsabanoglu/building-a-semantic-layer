@@ -1,0 +1,319 @@
+# =============================================================================
+# Semantic Layer — E-commerce Metric Definitions
+# =============================================================================
+#
+# Structure
+# ─────────
+#   contexts  — define FROM clause, base JOINs, and per-dimension JOIN recipes
+#   metrics   — define SELECT expressions, filters, and which context to use
+#
+# Execution contexts
+# ──────────────────
+# Two base contexts cover all metrics:
+#
+#   order_items_context  → anchor: order_items oi + JOIN orders o
+#                          Used for revenue metrics (gross, net, AOV, LTV).
+#
+#   orders_context       → anchor: orders o
+#                          Used for rate and fulfilment time metrics.
+#
+# Revenue rule: ALL revenue metrics read from order_items.line_total.
+#               orders.order_total is NEVER used.
+
+
+# ── Contexts ──────────────────────────────────────────────────────────────────
+
+contexts:
+
+  # --------------------------------------------------------------------------
+  order_items_context:
+    from: "order_items oi"
+    base_joins:
+      - table: orders
+        alias: o
+        condition: "oi.order_id = o.order_id"
+
+    # dimension_joins: additional JOINs added only when that dimension is used
+    dimension_joins:
+
+      product_category:
+        joins:
+          - table: products
+            alias: p
+            condition: "oi.product_id = p.product_id"
+        select: "p.product_category"
+
+      payment_method_preferred:
+        joins:
+          - table: customers
+            alias: c
+            condition: "o.customer_id = c.customer_id"
+        select: "c.payment_method_preferred"
+
+      purchase_date:
+        joins: []
+        select: "CAST(o.purchase_date AS DATE)"
+
+      purchase_month:
+        joins: []
+        select: "STRFTIME('%Y-%m', o.purchase_date)"
+
+      purchase_year:
+        joins: []
+        select: "STRFTIME('%Y', o.purchase_date)"
+
+      order_status:
+        joins: []
+        select: "o.order_status"
+
+      customer_id:
+        joins:
+          - table: customers
+            alias: c
+            condition: "o.customer_id = c.customer_id"
+        select: "c.customer_id"
+
+      # Derived dimension — requires a CTE to compute per-customer stats.
+      # Segments: 'new' (1 order), 'repeat' (2+ orders),
+      #           'churned' (no order in last 90 days relative to dataset max date)
+      customer_segment:
+        cte_name: customer_stats
+        cte_sql: |
+          SELECT
+              customer_id,
+              COUNT(order_id)    AS order_count,
+              MAX(purchase_date) AS last_order_date
+          FROM orders
+          GROUP BY customer_id
+        joins:
+          - table: customers
+            alias: c
+            condition: "o.customer_id = c.customer_id"
+          - table: customer_stats
+            alias: cs
+            condition: "c.customer_id = cs.customer_id"
+        select: >-
+          CASE
+            WHEN cs.order_count = 1
+              THEN 'new'
+            WHEN cs.last_order_date < (SELECT MAX(purchase_date) FROM orders) - INTERVAL '90 days'
+              THEN 'churned'
+            ELSE 'repeat'
+          END
+
+  # --------------------------------------------------------------------------
+  orders_context:
+    from: "orders o"
+    base_joins: []
+
+    dimension_joins:
+
+      product_category:
+        # Orders context needs order_items as a bridge to reach products
+        joins:
+          - table: order_items
+            alias: oi
+            condition: "o.order_id = oi.order_id"
+          - table: products
+            alias: p
+            condition: "oi.product_id = p.product_id"
+        select: "p.product_category"
+
+      payment_method_preferred:
+        joins:
+          - table: customers
+            alias: c
+            condition: "o.customer_id = c.customer_id"
+        select: "c.payment_method_preferred"
+
+      purchase_date:
+        joins: []
+        select: "CAST(o.purchase_date AS DATE)"
+
+      purchase_month:
+        joins: []
+        select: "STRFTIME('%Y-%m', o.purchase_date)"
+
+      purchase_year:
+        joins: []
+        select: "STRFTIME('%Y', o.purchase_date)"
+
+      order_status:
+        joins: []
+        select: "o.order_status"
+
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+
+metrics:
+
+  # ── Revenue ────────────────────────────────────────────────────────────────
+
+  gross_revenue:
+    description: >
+      Sum of order_items.line_total for completed and pending orders.
+      Excludes returned and cancelled orders.
+      Source: order_items.line_total — never orders.order_total.
+    context: order_items_context
+    type: aggregate
+    select_expr: >-
+      SUM(CASE WHEN o.order_status IN ('completed', 'pending')
+               THEN oi.line_total ELSE 0 END)
+
+  returned_revenue:
+    description: >
+      Sum of order_items.line_total for returned orders only.
+      Used as a component of net_revenue.
+    context: order_items_context
+    type: aggregate
+    select_expr: >-
+      SUM(CASE WHEN o.order_status = 'returned'
+               THEN oi.line_total ELSE 0 END)
+
+  net_revenue:
+    description: >
+      Gross revenue minus returned revenue.
+      Represents realised revenue after accounting for returns.
+      Formula: gross_revenue - returned_revenue.
+    context: order_items_context
+    type: derived
+    components: [gross_revenue, returned_revenue]
+    formula: "{gross_revenue} - {returned_revenue}"
+
+  gross_aov:
+    description: >
+      Average order value for completed and pending orders.
+      gross_aov = gross_revenue / count(distinct completed + pending orders).
+    context: order_items_context
+    type: aggregate
+    select_expr: >-
+      SUM(CASE WHEN o.order_status IN ('completed', 'pending')
+               THEN oi.line_total ELSE 0 END)
+      / NULLIF(
+          COUNT(DISTINCT CASE WHEN o.order_status IN ('completed', 'pending')
+                              THEN o.order_id END),
+          0)
+
+  net_aov:
+    description: >
+      Net average order value.
+      net_aov = net_revenue / count(distinct completed + pending + returned orders).
+      The denominator includes returned orders because they were fulfilled before return.
+    context: order_items_context
+    type: aggregate
+    select_expr: >-
+      (SUM(CASE WHEN o.order_status IN ('completed', 'pending')
+                THEN oi.line_total ELSE 0 END)
+       - SUM(CASE WHEN o.order_status = 'returned'
+                  THEN oi.line_total ELSE 0 END))
+      / NULLIF(
+          COUNT(DISTINCT CASE WHEN o.order_status IN ('completed', 'pending', 'returned')
+                              THEN o.order_id END),
+          0)
+
+  # ── Customer ───────────────────────────────────────────────────────────────
+
+  customer_ltv:
+    description: >
+      Lifetime value per customer: sum of order_items.line_total for completed
+      and pending orders, grouped by customer_id.
+      Default dimension is customer_id — no dimension argument required.
+    context: order_items_context
+    type: aggregate
+    select_expr: >-
+      SUM(CASE WHEN o.order_status IN ('completed', 'pending')
+               THEN oi.line_total ELSE 0 END)
+    default_dimension: customer_id
+
+  cancellation_rate:
+    description: >
+      Fraction of all orders that were cancelled.
+      cancellation_rate = cancelled_orders / total_orders.
+    context: orders_context
+    type: aggregate
+    select_expr: >-
+      COUNT(DISTINCT CASE WHEN o.order_status = 'cancelled'
+                          THEN o.order_id END) * 1.0
+      / NULLIF(COUNT(DISTINCT o.order_id), 0)
+
+  return_rate:
+    description: >
+      Fraction of all orders that were returned.
+      return_rate = returned_orders / total_orders.
+    context: orders_context
+    type: aggregate
+    select_expr: >-
+      COUNT(DISTINCT CASE WHEN o.order_status = 'returned'
+                          THEN o.order_id END) * 1.0
+      / NULLIF(COUNT(DISTINCT o.order_id), 0)
+
+  time_between_orders:
+    description: >
+      Average days between consecutive orders for repeat customers (2+ orders).
+      Single-purchase customers are excluded from the average but counted
+      separately in the single_purchase_customers output column.
+      Only considers orders with statuses: completed, pending, shipped, returned.
+    type: special
+    sql: |
+      WITH order_counts AS (
+          -- Count qualifying orders per customer
+          SELECT
+              customer_id,
+              COUNT(*)         AS order_count
+          FROM orders
+          WHERE order_status IN ('completed', 'pending', 'shipped', 'returned')
+          GROUP BY customer_id
+      ),
+      gaps AS (
+          -- Compute days between each order and the previous one for that customer
+          SELECT
+              customer_id,
+              DATEDIFF('day',
+                  LAG(purchase_date) OVER (PARTITION BY customer_id ORDER BY purchase_date),
+                  purchase_date
+              ) AS days_between
+          FROM orders
+          WHERE order_status IN ('completed', 'pending', 'shipped', 'returned')
+      )
+      SELECT
+          ROUND(AVG(days_between), 1)                          AS time_between_orders,
+          (SELECT COUNT(*) FROM order_counts WHERE order_count = 1) AS single_purchase_customers
+      FROM gaps
+      WHERE days_between IS NOT NULL
+
+  # ── Operations ─────────────────────────────────────────────────────────────
+
+  avg_fulfillment_time:
+    description: >
+      Average days between purchase_date and shipped_date.
+      Only for completed, shipped, and returned orders — these are the statuses
+      where a shipped_date should exist. Rows with NULL shipped_date are excluded.
+    context: orders_context
+    type: aggregate
+    select_expr: "ROUND(AVG(DATEDIFF('day', o.purchase_date, o.shipped_date)), 1)"
+    filters:
+      - "o.order_status IN ('completed', 'shipped', 'returned')"
+      - "o.shipped_date IS NOT NULL"
+
+  avg_delivery_time:
+    description: >
+      Average days between shipped_date and delivered_date.
+      Only for completed and returned orders — the statuses where a
+      delivered_date should exist. Rows with NULL delivered_date are excluded.
+    context: orders_context
+    type: aggregate
+    select_expr: "ROUND(AVG(DATEDIFF('day', o.shipped_date, o.delivered_date)), 1)"
+    filters:
+      - "o.order_status IN ('completed', 'returned')"
+      - "o.delivered_date IS NOT NULL"
+
+  avg_end_to_end_time:
+    description: >
+      Average days from purchase_date to delivered_date (full customer journey).
+      Only for completed and returned orders with a non-NULL delivered_date.
+    context: orders_context
+    type: aggregate
+    select_expr: "ROUND(AVG(DATEDIFF('day', o.purchase_date, o.delivered_date)), 1)"
+    filters:
+      - "o.order_status IN ('completed', 'returned')"
+      - "o.delivered_date IS NOT NULL"
